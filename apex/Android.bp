@@ -24,6 +24,9 @@ android_app_certificate {
 
 apex {
     name: "com.android.scheduling",
+    updatable: true,
+    min_sdk_version: "current",
+    java_libs: ["framework-scheduling", "service-scheduling"],
     manifest: "manifest.json",
     file_contexts: ":com.android.scheduling-file_contexts",
     key: "com.android.scheduling.key",
