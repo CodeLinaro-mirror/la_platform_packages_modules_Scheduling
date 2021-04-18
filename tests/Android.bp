@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
 android_test {
     name: "CtsRebootReadinessTestCases",
     manifest: "AndroidManifest.xml",
     srcs: ["src/**/*.java"],
     static_libs: ["androidx.test.rules", "truth-prebuilt", "androidx.test.core"],
-    test_suites: ["general-tests", "cts"],
+    test_suites: ["general-tests", "cts", "mts-scheduling"],
 }
