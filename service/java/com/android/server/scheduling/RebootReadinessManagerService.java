@@ -96,6 +96,8 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
     private static final String PROPERTY_DISABLE_APP_ACTIVITY_CHECK = "disable_app_activity_check";
     private static final String PROPERTY_DISABLE_SUBSYSTEMS_CHECK = "disable_subsystems_check";
     private static final String PROPERTY_ALARM_CLOCK_THRESHOLD_MS = "alarm_clock_threshold_ms";
+    private static final String PROPERTY_LOGGING_BLOCKING_ENTITY_THRESHOLD_MS =
+            "logging_blocking_entity_threshold_ms";
 
 
     private static final long DEFAULT_POLLING_INTERVAL_WHILE_IDLE_MS = TimeUnit.MINUTES.toMillis(1);
@@ -103,6 +105,8 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
             TimeUnit.MINUTES.toMillis(5);
     private static final long DEFAULT_INTERACTIVITY_THRESHOLD_MS = TimeUnit.MINUTES.toMillis(30);
     private static final long DEFAULT_ALARM_CLOCK_THRESHOLD_MS = TimeUnit.MINUTES.toMillis(10);
+    private static final long DEFAULT_LOGGING_BLOCKING_ENTITY_THRESHOLD_MS =
+            TimeUnit.HOURS.toMillis(1);
 
     @GuardedBy("mLock")
     private long mActivePollingIntervalMs = DEFAULT_POLLING_INTERVAL_WHILE_ACTIVE_MS;
@@ -127,6 +131,9 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
 
     @GuardedBy("mLock")
     private long mAlarmClockThresholdMs = DEFAULT_ALARM_CLOCK_THRESHOLD_MS;
+
+    @GuardedBy("mLock")
+    private long mLoggingBlockingEntityThresholdMs = DEFAULT_LOGGING_BLOCKING_ENTITY_THRESHOLD_MS;
 
     // A mapping of uid to package name for uids which have called markRebootPending. Reboot
     // readiness state changed broadcasts will only be sent to the values in this map.
@@ -176,12 +183,26 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
         }
     };
 
-    @VisibleForTesting
+    private final AlarmManager.OnAlarmListener mPollStateListener = () -> {
+        synchronized (mLock) {
+            if (!mCanceled) {
+                pollRebootReadinessState();
+            } else {
+                Log.w(TAG, "Received poll state callback while canceled.");
+            }
+        }
+    };
+
     RebootReadinessManagerService(Context context) {
+        this(context, new RebootReadinessLogger());
+    }
+
+    @VisibleForTesting
+    RebootReadinessManagerService(Context context, RebootReadinessLogger logger) {
         // TODO(b/161353402): Consolidate mHandler and mExecutor
         mHandler = new Handler(Looper.getMainLooper());
         mExecutor = new HandlerExecutor(mHandler);
-        mRebootReadinessLogger = new RebootReadinessLogger();
+        mRebootReadinessLogger = logger;
         updateConfigs();
         DeviceConfig.addOnPropertiesChangedListener(DeviceConfig.NAMESPACE_REBOOT_READINESS,
                 mExecutor, properties -> updateConfigs());
@@ -275,6 +296,7 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
                 // waiting for broadcasts
                 if (mCallingUidToPackageMap.size() == 0) {
                     mHandler.removeCallbacksAndMessages(null);
+                    mAlarmManager.cancel(mPollStateListener);
                     mCanceled = true;
                     mReadyToReboot = false;
                 }
@@ -324,8 +346,10 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
                 noteRebootReadinessStateChanged(currentRebootReadiness);
             }
             if (!mCanceled) {
-                mHandler.postDelayed(this::pollRebootReadinessState,
-                        getNextPollingIntervalMs(currentRebootReadiness));
+                mAlarmManager.setExact(AlarmManager.RTC_WAKEUP,
+                        System.currentTimeMillis()
+                                + getNextPollingIntervalMs(currentRebootReadiness),
+                        "poll_reboot_readiness", mPollStateListener, mHandler);
             }
         }
     }
@@ -350,8 +374,9 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
         return true;
     }
 
+    @VisibleForTesting
     @GuardedBy("mLock")
-    private boolean checkSystemComponentsState() {
+    boolean checkSystemComponentsState() {
         if (!mDisableSubsystemsCheck) {
             if (mBlockedByTethering) {
                 return false;
@@ -366,6 +391,7 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
         }
 
         final List<IRequestRebootReadinessStatusListener> blockingCallbacks = new ArrayList<>();
+        final List<String> blockingCallbackNames = new ArrayList<>();
         int i = mCallbacks.beginBroadcast();
         CountDownLatch latch = new CountDownLatch(i);
         while (i > 0) {
@@ -381,6 +407,7 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
                             if (!isReadyToReboot && (!mDisableSubsystemsCheck
                                     || name.startsWith(TEST_CALLBACK_PREFIX))) {
                                 blockingCallbacks.add(callback);
+                                blockingCallbackNames.add(name);
                             }
                             latch.countDown();
                         }
@@ -396,10 +423,13 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
         } catch (InterruptedException ignore) {
         }
         mCallbacks.finishBroadcast();
+        mRebootReadinessLogger.maybeLogLongBlockingComponents(blockingCallbackNames,
+                mLoggingBlockingEntityThresholdMs);
         return blockingCallbacks.size() == 0;
     }
 
-    private boolean checkDeviceInteractivity() {
+    @VisibleForTesting
+    boolean checkDeviceInteractivity() {
         final long now = SystemClock.elapsedRealtime();
         synchronized (mLock) {
             return (now - mLastTimeNotInteractiveMs) > mInteractivityThresholdMs;
@@ -410,17 +440,21 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
      * Check for important app activity in the background by querying the running services on the
      * device.
      */
-    private boolean checkBackgroundAppActivity() {
+    @VisibleForTesting
+    boolean checkBackgroundAppActivity() {
         if (mActivityManager != null) {
             final List<RunningServiceInfo> serviceInfos =
                     mActivityManager.getRunningServices(Integer.MAX_VALUE);
+            List<Integer> blockingUids = new ArrayList<>();
             for (int i = 0; i < serviceInfos.size(); i++) {
                 RunningServiceInfo info = serviceInfos.get(i);
                 if (info.foreground) {
-                    return false;
+                    blockingUids.add(info.uid);
                 }
             }
-            return true;
+            mRebootReadinessLogger.maybeLogLongBlockingApps(blockingUids,
+                    mLoggingBlockingEntityThresholdMs);
+            return blockingUids.size() == 0;
         }
         return false;
     }
@@ -429,8 +463,8 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
         synchronized (mLock) {
             Log.i(TAG, "Reboot readiness state changed to " + isReadyToReboot);
             mReadyToReboot = isReadyToReboot;
-            Intent intent = new Intent(Intent.ACTION_REBOOT_READY);
-            intent.putExtra(Intent.EXTRA_IS_READY_TO_REBOOT, isReadyToReboot);
+            Intent intent = new Intent(RebootReadinessManager.ACTION_REBOOT_READY);
+            intent.putExtra(RebootReadinessManager.EXTRA_IS_READY_TO_REBOOT, isReadyToReboot);
 
             // Send state change broadcast to any packages which have a pending update
             for (int i = 0; i < mCallingUidToPackageMap.size(); i++) {
@@ -485,6 +519,10 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
             mAlarmClockThresholdMs = DeviceConfig.getLong(
                     DeviceConfig.NAMESPACE_REBOOT_READINESS,
                     PROPERTY_ALARM_CLOCK_THRESHOLD_MS, DEFAULT_ALARM_CLOCK_THRESHOLD_MS);
+            mLoggingBlockingEntityThresholdMs = DeviceConfig.getLong(
+                    DeviceConfig.NAMESPACE_REBOOT_READINESS,
+                    PROPERTY_LOGGING_BLOCKING_ENTITY_THRESHOLD_MS,
+                    DEFAULT_LOGGING_BLOCKING_ENTITY_THRESHOLD_MS);
         }
     }
 
@@ -509,6 +547,13 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
         mTimesBlockedByInteractivity = 0;
         mTimesBlockedBySubsystems = 0;
         mTimesBlockedByAppActivity = 0;
+    }
+
+    @VisibleForTesting
+    SparseArray<ArraySet<String>> getCallingPackages() {
+        synchronized (mLock) {
+            return mCallingUidToPackageMap;
+        }
     }
 
     @Override
