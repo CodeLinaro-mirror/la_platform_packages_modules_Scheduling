@@ -23,8 +23,6 @@ import static com.android.server.scheduling.SchedulingStatsLog.LONG_REBOOT_BLOCK
 import android.annotation.CurrentTimeMillisLong;
 import android.annotation.IntDef;
 import android.content.ApexEnvironment;
-import android.content.Context;
-import android.content.pm.PackageManager;
 import android.os.SystemClock;
 import android.util.ArrayMap;
 import android.util.AtomicFile;
@@ -87,21 +85,13 @@ final class RebootReadinessLogger {
     // data directory, but a different directory may be injected for testing purposes.
     private final File mDeDir;
 
-    private final Context mContext;
-
-    private final PackageManager mPackageManager;
-
     @VisibleForTesting
-    RebootReadinessLogger(File deDir, Context context) {
+    RebootReadinessLogger(File deDir) {
         mDeDir = deDir;
-        mContext = context;
-        mPackageManager = mContext.getPackageManager();
     }
 
-    RebootReadinessLogger(Context context) {
+    RebootReadinessLogger() {
         mDeDir = ApexEnvironment.getApexEnvironment(MODULE_NAME).getDeviceProtectedDataDir();
-        mContext = context;
-        mPackageManager = mContext.getPackageManager();
     }
 
     /**
@@ -145,20 +135,6 @@ final class RebootReadinessLogger {
                 rebootStatsFile.finishWrite(stream);
             } catch (Exception e) {
                 Log.e(TAG, "Could not write reboot readiness stats: " + e);
-            }
-        }
-    }
-
-    /**
-     * Deletes any information that would have been logged post-reboot. This is called when
-     * the device becomes not ready to reboot.
-     */
-    void deleteLoggingInformation() {
-        synchronized (mLock) {
-            AtomicFile rebootStatsFile = getRebootStatsFile();
-            if (rebootStatsFile != null) {
-                rebootStatsFile.delete();
-                mNeedsToLogMetrics = false;
             }
         }
     }
@@ -289,36 +265,8 @@ final class RebootReadinessLogger {
         }
     }
 
-    /** Writes information about any UIDs which are blocking the reboot. */
-    void writeBlockingUids(PrintWriter pw) {
-        synchronized (mLock) {
-            for (int i = 0; i < mBlockingApps.size(); i++) {
-                int appUid = mBlockingApps.valueAt(i).mAppUid;
-                String[] pkgs = mPackageManager.getPackagesForUid(appUid);
-                pw.println("Blocking uid: " + appUid + ", package(s): " + String.join(",", pkgs));
-            }
-        }
-    }
-
-    /** Writes information about any subsystems which are blocking the reboot. */
-    void writeBlockingSubsystems(PrintWriter pw) {
-        synchronized (mLock) {
-            for (String subsystem : mBlockingComponents.keySet()) {
-                pw.println("Blocking subsystem: " + subsystem);
-            }
-        }
-    }
-
     void dump(PrintWriter pw) {
         synchronized (mLock) {
-            if (mBlockingComponents.size() > 0) {
-                writeBlockingSubsystems(pw);
-            }
-
-            if (mBlockingApps.size() > 0) {
-                writeBlockingUids(pw);
-            }
-
             if (mShouldDumpMetrics) {
                 pw.println("Previous reboot readiness checks:");
                 pw.println("    Start timestamp: " + mStartTime);

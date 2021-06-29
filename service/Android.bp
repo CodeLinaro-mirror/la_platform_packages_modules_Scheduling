@@ -59,7 +59,6 @@ java_library {
         "unsupportedappusage",
     ],
     static_libs: [
-        "modules-utils-os",
         "scheduling-statsd",
     ],
     jarjar_rules: ":scheduling-jarjar-rules",

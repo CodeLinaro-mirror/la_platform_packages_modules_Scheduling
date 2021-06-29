@@ -33,7 +33,6 @@ import android.os.Binder;
 import android.os.Handler;
 import android.os.HandlerExecutor;
 import android.os.Looper;
-import android.os.ParcelFileDescriptor;
 import android.os.PowerManager;
 import android.os.RemoteCallback;
 import android.os.RemoteCallbackList;
@@ -191,7 +190,7 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
     };
 
     RebootReadinessManagerService(Context context) {
-        this(context, new RebootReadinessLogger(context));
+        this(context, new RebootReadinessLogger());
     }
 
     @VisibleForTesting
@@ -234,13 +233,6 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
         }
         mHandler.post(mRebootReadinessLogger::readMetricsPostReboot);
         mContext = context;
-    }
-
-    @Override
-    public int handleShellCommand(ParcelFileDescriptor in, ParcelFileDescriptor out,
-            ParcelFileDescriptor err, String[] args) {
-        return new RebootReadinessShellCommand(this, mContext).exec(this, in.getFileDescriptor(),
-                out.getFileDescriptor(), err.getFileDescriptor(), args);
     }
 
     /**
@@ -293,7 +285,6 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
             ArraySet<String> packagesForUid =
                     mCallingUidToPackageMap.get(callingUid, new ArraySet<>());
             if (packagesForUid.contains(callingPackage)) {
-                Log.i(TAG, "Canceling reboot readiness checks for package: " + callingPackage);
                 packagesForUid.remove(callingPackage);
                 if (packagesForUid.size() == 0) {
                     // No remaining clients exist for this calling uid
@@ -366,7 +357,6 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
     private boolean getRebootReadinessLocked() {
         if (!(mDisableInteractivityCheck || checkDeviceInteractivity())) {
             mTimesBlockedByInteractivity++;
-            Log.v(TAG, "Reboot blocked by device interactivity");
             return false;
         }
 
@@ -434,11 +424,7 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
         mCallbacks.finishBroadcast();
         mRebootReadinessLogger.maybeLogLongBlockingComponents(blockingCallbackNames,
                 mLoggingBlockingEntityThresholdMs);
-        if (blockingCallbacks.size() > 0) {
-            Log.v(TAG, "Reboot blocked by subsystems: " + String.join(",", blockingCallbackNames));
-            return false;
-        }
-        return true;
+        return blockingCallbacks.size() == 0;
     }
 
     @VisibleForTesting
@@ -467,11 +453,7 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
             }
             mRebootReadinessLogger.maybeLogLongBlockingApps(blockingUids,
                     mLoggingBlockingEntityThresholdMs);
-            if (blockingUids.size() > 0) {
-                Log.v(TAG, "Reboot blocked by app uids: " + blockingUids.toString());
-                return false;
-            }
-            return true;
+            return blockingUids.size() == 0;
         }
         return false;
     }
@@ -494,22 +476,6 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
                         mPollingStartTimeMs, System.currentTimeMillis(),
                         mTimesBlockedByInteractivity, mTimesBlockedBySubsystems,
                         mTimesBlockedByAppActivity);
-
-                AlarmManager.AlarmClockInfo alarmClockInfo = mAlarmManager.getNextAlarmClock();
-                if (alarmClockInfo != null) {
-                    // Schedule a state check before the next alarm clock is triggered. This check
-                    // is triggered within the alarm clock threshold window (plus a small tolerance)
-                    // to ensure that this alarm clock will block the reboot at that time.
-                    long stateCheckTriggerTime = alarmClockInfo.getTriggerTime()
-                            - (mAlarmClockThresholdMs - TimeUnit.SECONDS.toMillis(1));
-                    if (stateCheckTriggerTime > System.currentTimeMillis()) {
-                        mAlarmManager.setExact(AlarmManager.RTC_WAKEUP,
-                                stateCheckTriggerTime, "poll_reboot_readiness",
-                                mPollStateListener, mHandler);
-                    }
-                }
-            } else {
-                mRebootReadinessLogger.deleteLoggingInformation();
             }
         }
     }
@@ -606,15 +572,5 @@ public class RebootReadinessManagerService extends IRebootReadinessManager.Stub 
                 pw.println("Current reboot readiness state: " + mReadyToReboot);
             }
         }
-    }
-
-    /** Writes information about any UIDs which are blocking the reboot. */
-    void writeBlockingUids(PrintWriter pw) {
-        mRebootReadinessLogger.writeBlockingUids(pw);
-    }
-
-    /** Writes information about any subsystems which are blocking the reboot. */
-    void writeBlockingSubsystems(PrintWriter pw) {
-        mRebootReadinessLogger.writeBlockingSubsystems(pw);
     }
 }
