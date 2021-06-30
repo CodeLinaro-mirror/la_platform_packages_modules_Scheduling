@@ -30,6 +30,7 @@ import static com.google.common.truth.Truth.assertThat;
 
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 
@@ -67,7 +68,11 @@ import org.mockito.Mock;
 import org.mockito.MockitoSession;
 import org.mockito.quality.Strictness;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileDescriptor;
+import java.io.FileReader;
+import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -91,6 +96,9 @@ public class RebootReadinessUnitTest {
 
     @Mock(answer = Answers.RETURNS_DEEP_STUBS)
     private TetheringManager mTetheringManager;
+
+    @Mock(answer = Answers.RETURNS_DEEP_STUBS)
+    private PackageManager mPackageManager;
 
     @Captor
     private ArgumentCaptor<Intent> mIntentArgumentCaptor;
@@ -123,7 +131,8 @@ public class RebootReadinessUnitTest {
     private static final String PROPERTY_LOGGING_BLOCKING_ENTITY_THRESHOLD_MS =
             "logging_blocking_entity_threshold_ms";
 
-    private static final String COMPONENT_NAME = "component";
+    // The prefix "TESTCOMPONENT" is used to allow testing when subsystem checks are disabled.
+    private static final String COMPONENT_NAME = "TESTCOMPONENT_component";
 
     // Small delay to allow DeviceConfig updates to propagate.
     private static final int DEVICE_CONFIG_DELAY = 1000;
@@ -155,6 +164,7 @@ public class RebootReadinessUnitTest {
         when(mPowerManager.isInteractive()).thenReturn(true);
         doReturn(mTetheringManager).when(mMockContext).getSystemService(eq(TetheringManager.class));
         when(mAlarmManager.getNextAlarmClock()).thenReturn(null);
+        when(mMockContext.getPackageManager()).thenReturn(mPackageManager);
         InstrumentationRegistry.getInstrumentation().getUiAutomation()
                 .adoptShellPermissionIdentity(Manifest.permission.WRITE_DEVICE_CONFIG,
                         Manifest.permission.READ_DEVICE_CONFIG,
@@ -162,7 +172,7 @@ public class RebootReadinessUnitTest {
                         Manifest.permission.ACCESS_NETWORK_STATE);
         initializeDeviceConfig();
         File testDir = new File(mMockContext.getFilesDir(), "reboot-readiness");
-        mLogger = spy(new RebootReadinessLogger(testDir));
+        mLogger = spy(new RebootReadinessLogger(testDir, mMockContext));
         mService = new RebootReadinessManagerService(mMockContext, mLogger);
     }
 
@@ -410,12 +420,162 @@ public class RebootReadinessUnitTest {
      * Test that logging information is correctly written and read before and after the reboot.
      */
     @Test
-    public void testReadingAndWritingUnattendedReboot() throws Exception {
+    public void testReadingAndWritingUnattendedReboot() {
         mLogger.writeAfterRebootReadyBroadcast(1000, 2000, 0, 0, 0);
         mLogger.readMetricsPostReboot();
         mLogger.writePostRebootMetrics();
         verify(() -> SchedulingStatsLog.write(eq(SchedulingStatsLog.UNATTENDED_REBOOT_OCCURRED),
                 eq(1000L), anyLong(), eq(0), eq(0), eq(0)));
+    }
+
+    /**
+     * Test that no metrics are logged if the device became not ready to reboot before rebooting.
+     */
+    @Test
+    public void testMetricsClearedWhenNotReadyToReboot() throws Exception {
+        mService.markRebootPending(TEST_PACKAGE);
+        Thread.sleep(STATE_CHANGE_DELAY);
+        assertThat(mService.isReadyToReboot()).isTrue();
+
+        // Make device interactive and allow the device to become not reboot-ready for a while.
+        DeviceConfig.setProperty(DeviceConfig.NAMESPACE_REBOOT_READINESS,
+                PROPERTY_DISABLE_INTERACTIVITY_CHECK, "false", false);
+        Thread.sleep(DEVICE_CONFIG_DELAY);
+        setScreenState(true);
+        Thread.sleep(STATE_CHANGE_DELAY);
+        assertThat(mService.isReadyToReboot()).isFalse();
+
+        // The device has become not ready to reboot, therefore no metrics should be logged.
+        mLogger.readMetricsPostReboot();
+        mLogger.writePostRebootMetrics();
+        verify(() -> SchedulingStatsLog.write(eq(SchedulingStatsLog.UNATTENDED_REBOOT_OCCURRED),
+                anyLong(), anyLong(), anyInt(), anyInt(), anyInt()), never());
+    }
+
+    /**
+     * Test that a pending alarm clock will cause the reboot readiness state to be checked before
+     * the alarm triggers.
+     */
+    @Test
+    public void testAlarmClockCheckWhileReadyToReboot() throws Exception {
+        DeviceConfig.setProperty(DeviceConfig.NAMESPACE_REBOOT_READINESS,
+                PROPERTY_DISABLE_SUBSYSTEMS_CHECK, "false", false);
+        DeviceConfig.setProperty(DeviceConfig.NAMESPACE_REBOOT_READINESS,
+                PROPERTY_ALARM_CLOCK_THRESHOLD_MS, Long.toString(5000), false);
+        Thread.sleep(DEVICE_CONFIG_DELAY);
+
+        // Alarm clock is scheduled for 6 seconds from now. The device will initially be ready
+        // to reboot, but another check will be scheduled before the alarm triggers, causing the
+        // device to no longer be ready to reboot.
+        AlarmManager.AlarmClockInfo alarm = new AlarmManager.AlarmClockInfo(
+                System.currentTimeMillis() + 6000, null);
+        when(mAlarmManager.getNextAlarmClock()).thenReturn(alarm);
+        mService.markRebootPending(TEST_PACKAGE);
+        assertThat(mService.isReadyToReboot()).isTrue();
+        Thread.sleep(STATE_CHANGE_DELAY);
+        assertThat(mService.isReadyToReboot()).isFalse();
+    }
+
+    /**
+     * Test that reboot readiness checks happen for the duration supplied by the timeout flag.
+     */
+    @Test
+    public void testStateChangeListenerShellCommand() throws Exception {
+        Long startTime = System.currentTimeMillis();
+        executeShellCommand("start-readiness-checks --timeout-secs 10");
+        Long endTime = System.currentTimeMillis();
+        assertThat(endTime - startTime).isGreaterThan(10000);
+    }
+
+    /**
+     * Test that the check-interactivity-state shell command prints the correct output.
+     */
+    @Test
+    public void testInteractivityShellCommand() throws Exception {
+        setScreenState(false);
+        String output = executeShellCommand(
+                "check-interactivity-state --interactivity-threshold-ms 0");
+        assertThat(output).contains("true");
+
+        setScreenState(true);
+        output = executeShellCommand("check-interactivity-state --interactivity-threshold-ms 0");
+        assertThat(output).contains("false");
+    }
+
+    /**
+     * Test that the check-subsystems-state shell command prints the correct output.
+     */
+    @Test
+    public void testSubsystemsShellCommand() throws Exception {
+        String output = executeShellCommand("check-subsystems-state");
+        assertThat(output).contains("true");
+
+        mService.addRequestRebootReadinessStatusListener(getStatusListener(new CountDownLatch(1)));
+        output = executeShellCommand("check-subsystems-state --list-blocking");
+        assertThat(output).contains("false");
+        assertThat(output).contains("Blocking subsystem: " + COMPONENT_NAME);
+    }
+
+    /**
+     * Test that the check-app-activity-state shell command prints the correct output.
+     */
+    @Test
+    public void testAppActivityShellCommand() throws Exception {
+        List<ActivityManager.RunningServiceInfo> runningServicesList = new ArrayList<>();
+        when(mActivityManager.getRunningServices(anyInt())).thenReturn(runningServicesList);
+        String output = executeShellCommand("check-app-activity-state --list-blocking");
+        assertThat(output).contains("true");
+
+        ActivityManager.RunningServiceInfo service = new ActivityManager.RunningServiceInfo();
+        service.foreground = true;
+        service.uid = 1234;
+        runningServicesList.add(service);
+
+        doReturn(new String[]{"test.package"}).when(mPackageManager).getPackagesForUid(anyInt());
+        output = executeShellCommand("check-app-activity-state --list-blocking");
+        assertThat(output).contains("false");
+        assertThat(output).containsMatch("Blocking uid: 1234.*test.package");
+    }
+
+    /**
+     * Test that DeviceConfig values may be tuned by the shell command interface.
+     */
+    @Test
+    public void testShellCommandDeviceConfig() throws Exception {
+        executeShellCommand("check-interactivity-state --polling-interval-ms 1234"
+                + " --interactivity-threshold-ms 2468 --disable-interactivity-checks"
+                + " --disable-subsystem-checks --disable-app-activity-checks");
+        assertThat(DeviceConfig.getBoolean(DeviceConfig.NAMESPACE_REBOOT_READINESS,
+                PROPERTY_DISABLE_INTERACTIVITY_CHECK, false)).isTrue();
+        assertThat(DeviceConfig.getBoolean(DeviceConfig.NAMESPACE_REBOOT_READINESS,
+                PROPERTY_DISABLE_SUBSYSTEMS_CHECK, false)).isTrue();
+        assertThat(DeviceConfig.getBoolean(DeviceConfig.NAMESPACE_REBOOT_READINESS,
+                PROPERTY_DISABLE_APP_ACTIVITY_CHECK, false)).isTrue();
+        assertThat(DeviceConfig.getLong(DeviceConfig.NAMESPACE_REBOOT_READINESS,
+                PROPERTY_ACTIVE_POLLING_INTERVAL_MS, 0)).isEqualTo(1234);
+        assertThat(DeviceConfig.getLong(DeviceConfig.NAMESPACE_REBOOT_READINESS,
+                PROPERTY_INTERACTIVITY_THRESHOLD_MS, 0)).isEqualTo(2468);
+    }
+
+    /**
+     * Calls the equivalent of "adb shell cmd reboot_readiness" and returns the output.
+     */
+    private String executeShellCommand(String command) throws Exception {
+        RebootReadinessShellCommand commandHandler =
+                spy(new RebootReadinessShellCommand(mService, mMockContext));
+        File tmpFile = File.createTempFile("output", ".txt");
+        PrintWriter pw = new PrintWriter(tmpFile);
+        doReturn(pw).when(commandHandler).getOutPrintWriter();
+        commandHandler.exec(new Binder(), new FileDescriptor(), new FileDescriptor(),
+                new FileDescriptor(), command.split(" "));
+        pw.flush();
+        BufferedReader reader = new BufferedReader(new FileReader(tmpFile));
+        String line;
+        StringBuilder sb = new StringBuilder();
+        while ((line = reader.readLine()) != null) {
+            sb.append(line);
+        }
+        return sb.toString();
     }
 
     /**
