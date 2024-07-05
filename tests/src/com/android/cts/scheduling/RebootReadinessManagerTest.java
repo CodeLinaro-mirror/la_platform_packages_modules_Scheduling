@@ -291,7 +291,9 @@ public class RebootReadinessManagerTest {
 
     private static void adoptShellPermissions() {
         InstrumentationRegistry.getInstrumentation().getUiAutomation().adoptShellPermissionIdentity(
-                Manifest.permission.REBOOT, Manifest.permission.WRITE_DEVICE_CONFIG,
+                Manifest.permission.REBOOT,
+                Manifest.permission.WRITE_DEVICE_CONFIG, // permission required for T-
+                Manifest.permission.READ_DEVICE_CONFIG,  // permission required for T-
                 Manifest.permission.SIGNAL_REBOOT_READINESS,
                 Manifest.permission.INTERACT_ACROSS_USERS_FULL);
     }
@@ -303,6 +305,13 @@ public class RebootReadinessManagerTest {
 
     private static void setPropertyAndWait(String property, String value)
             throws InterruptedException {
+        // Since the OnPropertiesChangedListener only detects a change in property, first check if
+        // property is already the desired value.
+        if (DeviceConfig.getString(DeviceConfig.NAMESPACE_REBOOT_READINESS,
+                property,  /* defaultValue= */ "").equals(value)) {
+            return;
+        }
+
         ConfigListener configListener = new ConfigListener(property, value);
         DeviceConfig.addOnPropertiesChangedListener(DeviceConfig.NAMESPACE_REBOOT_READINESS,
                 sHandlerExecutor, configListener);
